@@ -5,7 +5,11 @@ test_consumer_integration.py — Test d'intégration du consumer corrigé.
 Simule le consumer scrum-master (aucun appel LLM/GitHub/Honcho) :
 - process_agent_events() avec les vraies fonctions du dépôt
 - rejoue le scénario de production : événement SCRUM_REVIEW_COMPLETED
-  ancien, présenté 3 cycles de suite + après expiration simulée du claim.
+  ancien, présenté 3 cycles de suite + après expiration simulée du claim
+- 120 événements via le VRAI process_agent_events
+- événements invalides journalisés sans publication ni marquage.
+
+Redis jetable démarré/arrêté par le dispositif de test (redis_fixture).
 """
 
 import json
@@ -14,11 +18,11 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import tests.redis_fixture as fixture
 from launcher.agent_inbox_consumer import process_agent_events
 from protocol.event_transitions import transitions_key
 
-REDIS_HOST = os.environ.get("FLEET_TEST_REDIS_URL", "127.0.0.1")
-REDIS_PORT = int(os.environ.get("FLEET_TEST_REDIS_PORT", "6399"))
 AGENT = "scrum-master"
 
 
@@ -27,29 +31,39 @@ class TestConsumerIntegration(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        try:
-            import redis
-        except ImportError:
-            raise unittest.SkipTest("redis-py non installé")
+        addr = fixture.start_test_redis()
+        if addr is None:
+            raise unittest.SkipTest(
+                "Redis de test INDISPONIBLE — tests SKIPÉS (pas PASS). "
+                "Installer redis-server pour les exécuter."
+            )
+        cls.redis_addr = addr
+        import redis
         cls.r = redis.Redis(
-            host=REDIS_HOST, port=REDIS_PORT,
+            host=addr[0], port=addr[1],
             decode_responses=True, socket_connect_timeout=5,
         )
-        try:
-            cls.r.ping()
-        except Exception:
-            raise unittest.SkipTest("Redis de test indisponible sur 6399")
+        cls.r.ping()
+
+    @classmethod
+    def tearDownClass(cls):
+        fixture.stop_test_redis()
 
     def setUp(self):
+        self._cleanup()
+
+    def tearDown(self):
+        self._cleanup()
+
+    def _cleanup(self):
+        # Instance démarrée par la fixture uniquement : aucun risque de
+        # nettoyer une instance externe fournie par variable.
         for pattern in ("fleet:transitions:*", "claim:transition:*",
                         "inbox:product-owner", "events:scrum-master",
-                        "queue:*"):
+                        "queue:dev-web"):
             keys = list(self.r.scan_iter(match=pattern, count=100))
             if keys:
                 self.r.delete(*keys)
-
-    def tearDown(self):
-        self.setUp()
 
     def _old_scrum_event(self):
         """Événement historique de production (sans UUID dédié)."""
@@ -66,28 +80,25 @@ class TestConsumerIntegration(unittest.TestCase):
         evt = self._old_scrum_event()
         self.r.rpush(f"events:{AGENT}", json.dumps(evt))
 
-        # Cycle 1 : publication (l'événement n'a jamais été marqué durablement).
         process_agent_events(self.r, AGENT)
         self.assertEqual(self.r.llen("inbox:product-owner"), 1)
 
-        # Cycles 2 et 3 : aucune republication (marqueur durable).
         process_agent_events(self.r, AGENT)
         process_agent_events(self.r, AGENT)
         self.assertEqual(self.r.llen("inbox:product-owner"), 1)
 
-        # Expiration simulée de TOUS les claims temporaires : toujours rien.
         for key in list(self.r.scan_iter(match="claim:transition:*", count=100)):
             self.r.delete(key)
         process_agent_events(self.r, AGENT)
         self.assertEqual(self.r.llen("inbox:product-owner"), 1,
                          "BUG: republication après expiration du claim")
 
-        # Le marqueur durable contient exactement une transition.
         self.assertEqual(self.r.scard(transitions_key(AGENT)), 1)
 
-    def test_more_than_10_events_all_processed(self):
-        """15 événements : la fenêtre paginée n'en ignore aucun."""
-        for i in range(15):
+    def test_120_events_via_real_process_agent_events(self):
+        """120 événements via le VRAI process_agent_events : 120 publications,
+        et un second cycle n'en republie AUCUNE."""
+        for i in range(120):
             evt = {
                 "type": "SCRUM_REVIEW_COMPLETED",
                 "task_id": f"task_bulk_{i}",
@@ -97,7 +108,28 @@ class TestConsumerIntegration(unittest.TestCase):
             }
             self.r.rpush(f"events:{AGENT}", json.dumps(evt))
         process_agent_events(self.r, AGENT)
-        self.assertEqual(self.r.llen("inbox:product-owner"), 15)
+        self.assertEqual(self.r.llen("inbox:product-owner"), 120)
+        # Second cycle complet : idempotence sur les 120.
+        process_agent_events(self.r, AGENT)
+        self.assertEqual(self.r.llen("inbox:product-owner"), 120)
+        self.assertEqual(self.r.scard(transitions_key(AGENT)), 120)
+
+    def test_invalid_events_logged_not_published_not_marked(self):
+        """Événements invalides : journalisés, sans publication ni marquage."""
+        invalid_events = [
+            {"type": "SCRUM_REVIEW_COMPLETED", "task_id": "t"},           # pas de msg_id/ts
+            {"type": "SCRUM_REVIEW_COMPLETED"},                            # pas de task_id
+            {"type": "TASK_ASSIGNED", "task_id": "t"},                     # pas d'identité
+            {"type": "UNKNOWN_TYPE", "task_id": "t", "msg_id": "m"},       # type ignoré
+            "not-json",                                                    # JSON invalide
+        ]
+        for e in invalid_events:
+            self.r.rpush(f"events:{AGENT}", e if isinstance(e, str) else json.dumps(e))
+        process_agent_events(self.r, AGENT)
+        # Aucune publication, aucun marquage.
+        self.assertEqual(self.r.llen("inbox:product-owner"), 0)
+        self.assertEqual(self.r.llen("queue:dev-web"), 0)
+        self.assertEqual(self.r.scard(transitions_key(AGENT)), 0)
 
     def test_new_revision_after_old_one(self):
         """Nouvelle révision (nouveau msg_id) : nouvelle publication autorisée."""
@@ -108,7 +140,7 @@ class TestConsumerIntegration(unittest.TestCase):
         new = {
             "type": "SCRUM_REVIEW_COMPLETED",
             "task_id": "task_v41_validation_scenario_1",
-            "msg_id": "res_NEW_revision_2",  # nouvelle révision
+            "msg_id": "res_NEW_revision_2",
             "reviewed_at": "2026-09-21T12:00:00Z",
             "success": True,
         }
