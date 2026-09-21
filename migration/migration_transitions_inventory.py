@@ -86,20 +86,74 @@ def _expected_msg_type(evt: dict) -> str:
     return "REVIEW_REQUEST" if evt.get("type") == "SCRUM_REVIEW_COMPLETED" else "TICKET_ASSIGN"
 
 
+# ── Liaison source exacte ────────────────────────────────────────────────────
+
+# Formats historiques documentés (observés en production, cf. inbox:po et
+# queue:dev-web) :
+#   REVIEW_REQUEST (Scrum → PO) :
+#     id = "scrum_to_po_<task_id>_<source_msg_id>"
+#     (ex. scrum_to_po_task_x_res_rev1)
+#   TICKET_ASSIGN (Scrum → dev) :
+#     id = "scrum_to_<assigned_to>_<task_id>_<source_msg_id>"
+#     (ex. scrum_to_dev-web_task_fix_694_res_asg1)
+# Ces formats sont reconstruits INTÉGRALEMENT et comparés par ÉGALITÉ
+# stricte. Aucun rapprochement par sous-chaîne (evt_msg_id in m_id) :
+# "res_rev1" matcherait "res_rev10" — interdit.
+def _historic_message_id(evt: dict) -> str | None:
+    """Format historique documenté, reconstruit intégralement selon le type."""
+    task_id = evt.get("task_id", "")
+    source_msg_id = evt.get("msg_id", "")
+    if evt.get("type") == "SCRUM_REVIEW_COMPLETED":
+        return f"scrum_to_po_{task_id}_{source_msg_id}"
+    if evt.get("type") == "TASK_ASSIGNED":
+        assigned = evt.get("assigned_to", "")
+        return f"scrum_to_{assigned}_{task_id}_{source_msg_id}"
+    return None
+
+
+def _source_link_exact(evt: dict, m: dict) -> bool:
+    """Liaison source EXPLICITE et EXACTE uniquement.
+
+    Accepte uniquement :
+      1. m["in_reply_to"] == evt["msg_id"] (liaison protocolaire exacte) ;
+      2. m["id"] == format historique reconstruit intégralement
+         (égalité stricte, jamais une sous-chaîne).
+    Tout le reste (sous-chaîne, préfixe, ressemblance) → False.
+    """
+    evt_msg_id = evt.get("msg_id")
+    if not evt_msg_id:
+        return False
+    if m.get("in_reply_to") == evt_msg_id:
+        return True
+    expected = _historic_message_id(evt)
+    return expected is not None and m.get("id") == expected
+
+
+def _recipient_matches(evt: dict, m: dict) -> bool:
+    """Vérifie le destinataire DANS LE CONTENU du message.
+
+    - REVIEW_REQUEST → m["to"] == "product-owner"
+    - TICKET_ASSIGN  → m["to"] == evt["assigned_to"]
+    Destinataire absent ou contradictoire → False. Un nom de fichier ne
+    remplace JAMAIS cette vérification.
+    """
+    expected_to = "product-owner" if evt.get("type") == "SCRUM_REVIEW_COMPLETED" else evt.get("assigned_to")
+    return m.get("to") == expected_to
+
+
 def _scan_list_evidence(r, list_key: str, evt: dict, tid: str) -> dict | None:
     """Cherche dans une liste Redis une preuve EXACTE de la transition.
 
     Retourne la preuve (dict) ou None. Le rapprochement se fait sur le
     CONTENU du message :
-      1. transition_id == tid (preuve des publications du nouveau code) ;
-      2. liaison au msg_id SOURCE de l'événement (id du message historique
-         au format <...>_<source_msg_id>, ou champ in_reply_to)
-         + task_id + type de message attendu ;
+      1. transition_id == tid (égalité exacte, preuve du nouveau code) ;
+      2. liaison source EXACTE (in_reply_to ou format historique reconstruit
+         et comparé par égalité) + task_id + type attendu + destinataire
+         vérifié dans le contenu ;
       3. sinon : rien (un task_id partagé seul NE PROUVE PAS la transition —
          deux révisions de la même tâche partagent le task_id).
     """
     evt_task = evt.get("task_id")
-    evt_msg_id = evt.get("msg_id")
     expected_type = _expected_msg_type(evt)
     for raw in r.lrange(list_key, 0, -1):
         try:
@@ -108,14 +162,15 @@ def _scan_list_evidence(r, list_key: str, evt: dict, tid: str) -> dict | None:
             continue
         if m.get("task_id") != evt_task or m.get("type") != expected_type:
             continue
+        # Destinataire vérifié dans le CONTENU (jamais le nom de fichier).
+        if not _recipient_matches(evt, m):
+            continue
         # 1. transition_id exact (nouveau code).
         if m.get("transition_id") == tid:
             return {"kind": "list", "key": list_key, "match": "transition_id"}
-        # 2. Liaison au msg_id source (messages historiques).
-        if evt_msg_id:
-            m_id = m.get("id", "")
-            if evt_msg_id in m_id or m.get("in_reply_to") == evt_msg_id:
-                return {"kind": "list", "key": list_key, "match": "source_msg_id_linked"}
+        # 2. Liaison source exacte (historique).
+        if _source_link_exact(evt, m):
+            return {"kind": "list", "key": list_key, "match": "source_msg_id_linked"}
     return None
 
 
@@ -124,14 +179,13 @@ def _scan_registry_evidence(registry_dir: str, evt: dict, tid: str) -> dict | No
 
     Le NOM de fichier ne compte PAS : seul le CONTENU est lu. Un fichier dont
     le nom contient le task_id mais dont le contenu est sans rapport n'est
-    PAS une preuve. Le destinataire doit correspondre à la cible de la
-    transition (une preuve pour un autre destinataire n'est pas retenue).
+    PAS une preuve. Le destinataire est vérifié DANS LE CONTENU du message
+    (to == product-owner / to == assigned_to) — le préfixe du nom de fichier
+    n'est qu'un indice de parcours, jamais une preuve.
     """
     evt_task = evt.get("task_id")
-    evt_msg_id = evt.get("msg_id")
     if not evt_task or not os.path.isdir(registry_dir):
         return None
-    target_prefix = "product-owner" if evt.get("type") == "SCRUM_REVIEW_COMPLETED" else None
     expected_type = _expected_msg_type(evt)
     for fname in sorted(os.listdir(registry_dir)):
         if not fname.endswith(".json"):
@@ -142,20 +196,22 @@ def _scan_registry_evidence(registry_dir: str, evt: dict, tid: str) -> dict | No
                 entry = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
-        # Destinataire : l'entrée doit concerner la cible de la transition.
-        if target_prefix and not fname.startswith(target_prefix + "_"):
-            continue
         msg = entry.get("message", entry)
         if msg.get("task_id") != evt_task or msg.get("type") != expected_type:
+            continue
+        # Destinataire vérifié dans le CONTENU du message.
+        if not _recipient_matches(evt, msg):
             continue
         # 1. transition_id exact.
         if msg.get("transition_id") == tid:
             return {"kind": "registry", "file": fname, "match": "transition_id"}
-        # 2. Liaison au msg_id source.
+        # 2. Liaison source exacte (in_reply_to, format historique reconstruit,
+        #    ou champ msg_id du registre — égalité stricte).
+        evt_msg_id = evt.get("msg_id")
         if evt_msg_id:
-            m_id = msg.get("id", "")
-            if (evt_msg_id in m_id or msg.get("in_reply_to") == evt_msg_id
-                    or entry.get("msg_id") == evt_msg_id):
+            if (msg.get("in_reply_to") == evt_msg_id
+                    or entry.get("msg_id") == evt_msg_id
+                    or _source_link_exact(evt, msg)):
                 return {"kind": "registry", "file": fname, "match": "source_msg_id_linked"}
     return None
 
@@ -183,13 +239,74 @@ def find_evidence(r, evt: dict, agent: str, registry_dir: str, tid: str) -> tupl
 
 # ── Vérification préalable de reprise ────────────────────────────────────────
 
-def verify_resume_ready(report: dict) -> tuple[bool, list[dict]]:
-    """Refuse la reprise tant qu'il reste des transitions UNKNOWN.
+_VALID_STATUSES = ("DONE", "UNKNOWN")
+
+
+def _validate_report_structure(report: dict | None, expected_agent: str | None = None) -> list[str]:
+    """Valide la STRUCTURE du rapport avant d'examiner les statuts.
+
+    Retourne la liste des erreurs (vide = structure valide) :
+      - rapport absent/vide ({} doit être refusé) ;
+      - agent attendu (si fourni) ;
+      - liste 'transitions' présente et itérable ;
+      - compteurs 'counts' présents et COHÉRENTS avec la liste ;
+      - chaque DONE : transition_id, source_id et evidence présents ;
+      - statut absent ou non reconnu → refus.
+    Un inventaire réellement vide (transitions == [], counts == 0) reste
+    acceptable s'il est complet et cohérent.
+    """
+    errors: list[str] = []
+    if not isinstance(report, dict) or not report:
+        return ["report_missing_or_empty"]
+    if expected_agent is not None and report.get("agent") != expected_agent:
+        errors.append(f"agent_mismatch:expected={expected_agent},got={report.get('agent')!r}")
+    transitions = report.get("transitions")
+    if not isinstance(transitions, list):
+        errors.append("transitions_missing_or_not_a_list")
+        return errors
+    counts = report.get("counts")
+    if not isinstance(counts, dict):
+        errors.append("counts_missing")
+        counts = {}
+    seen = {"DONE": 0, "UNKNOWN": 0}
+    for i, t in enumerate(transitions):
+        if not isinstance(t, dict):
+            errors.append(f"transition[{i}]:not_an_object")
+            continue
+        status = t.get("status")
+        if status not in _VALID_STATUSES:
+            errors.append(f"transition[{i}]:invalid_status:{status!r}")
+            continue
+        seen[status] = seen.get(status, 0) + 1
+        if status == "DONE":
+            for field in ("transition_id", "source_id", "evidence"):
+                if not t.get(field):
+                    errors.append(f"transition[{i}]:done_missing_{field}")
+    for key in _VALID_STATUSES:
+        if counts.get(key) != seen[key]:
+            errors.append(f"counts_mismatch:{key}:reported={counts.get(key)!r},actual={seen[key]}")
+    return errors
+
+
+def verify_resume_ready(report: dict | None, expected_agent: str | None = None) -> tuple[bool, list[dict]]:
+    """Refuse la reprise tant que la structure est invalide ou qu'il reste
+    des transitions UNKNOWN.
 
     Le consumer ne lit pas l'inventaire : cette vérification DOIT être
     exécutée par l'opérateur AVANT tout redémarrage de consumer. Elle ne
     démarre aucun service et n'écrit rien.
+
+    PORTÉE — --check-resume valide l'INVENTAIRE uniquement :
+      il NE vérifie NI la présence des marqueurs fleet:transitions:* dans
+      Redis, NI l'état des services (consumers arrêtés, watchdog, etc.).
+      Ces vérifications sont à la charge de l'opérateur.
+
+    En cas d'erreur de structure, retourne (False, [{"reason": "..."}]).
     """
+    errors = _validate_report_structure(report, expected_agent)
+    if errors:
+        return False, [{"reason": e} for e in errors]
+    assert report is not None  # garanti par _validate_report_structure
     unknowns = [t for t in report.get("transitions", []) if t.get("status") == "UNKNOWN"]
     return (len(unknowns) == 0, unknowns)
 
@@ -282,7 +399,7 @@ def main() -> int:
             return 2
         with open(inv_path) as f:
             report = json.load(f)
-        ok, unknowns = verify_resume_ready(report)
+        ok, unknowns = verify_resume_ready(report, expected_agent=args.agent)
         result = {
             "resume_ready": ok,
             "unknown_count": len(unknowns),
@@ -290,6 +407,8 @@ def main() -> int:
                 {"task_id": u.get("task_id"), "msg_id": u.get("msg_id"), "reason": u.get("reason")}
                 for u in unknowns
             ],
+            "scope_note": "check-resume validates the INVENTORY only: it does NOT verify "
+                          "fleet:transitions:* markers in Redis, nor service state.",
         }
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if ok else 1
