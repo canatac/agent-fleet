@@ -1,0 +1,24 @@
+[Unit]
+Description=Fleet Hermes Launcher Relay v4.1 (agent: %i)
+After=network-online.target redis-server.service
+Wants=network-online.target
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/agent-fleet/fleet.env
+ExecStart=/usr/bin/python3 /opt/fleet/launcher/fleet_relay_v4_1.py %i
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

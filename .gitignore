@@ -1,0 +1,41 @@
+# Secrets et configuration locale
+.env
+.env.*
+!.env.example
+secrets/
+config/local/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Données d'exploitation et conversations
+.hermes/
+.ssh/
+runtime/
+data/
+logs/
+backups/
+checkpoints/
+*.log
+*.db
+*.db-*
+*.sqlite*
+*.rdb
+*.aof
+*.dump
+*.bak
+*.bak.*
+
+# Python et outils
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/

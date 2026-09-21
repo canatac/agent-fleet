@@ -1,0 +1,18 @@
+[Unit]
+Description=Fleet Inbox Consumer for agent: %i
+After=network-online.target redis-server.service
+Wants=network-online.target
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/agent-fleet/fleet.env
+ExecStart=/usr/bin/python3 /opt/fleet/launcher/agent_inbox_consumer.py %i
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
