@@ -226,51 +226,87 @@ def build_agent_query(agent: str, msg: dict) -> str:
 
 
 def process_agent_events(r, agent: str) -> None:
-    """Traite les événements post-exécution de l'agent."""
+    """Traite les événements post-exécution de l'agent.
+
+    Idempotence (fix boucle de republication 2026-09-21) :
+    chaque transition événement → cible est publiée exactement une fois,
+    identifiable par un marqueur durable (SADD sans expiration) et non plus
+    par un claim NX EX temporaire. Parcours paginé de TOUS les événements
+    (l'ancienne fenêtre lrange(-10, -1) pouvait ignorer des événements non
+    traités).
+    """
+    from protocol.event_transitions import event_source_id, publish_transition_once
+
     events_key = f"events:{agent}"
-    events = r.lrange(events_key, -10, -1)
-    for evt_str in events:
-        try:
-            evt = json.loads(evt_str)
-        except json.JSONDecodeError:
-            continue
-
-        evt_type = evt.get("type")
-        task_id = evt.get("task_id")
-
-        # Événements de type TASK_ASSIGNED (Scrum Master → dev)
-        if evt_type == "TASK_ASSIGNED":
-            assigned_to = evt.get("assigned_to")
-            if assigned_to:
-                claim_key = f"claim:{agent}_event:{task_id}:assigned"
-                if not r.set(claim_key, "1", nx=True, ex=3600):
-                    continue
-                msg = make_message(
-                    type="TICKET_ASSIGN",
-                    to=assigned_to,
-                    from_=agent,
-                    body=f"Tâche assignée par {agent} : {task_id}. Veuillez exécuter.",
-                    task_id=task_id,
-                    extra={"reply_to": agent, "workspace_dir": "/root/misfits-web"},
-                )
-                r.rpush(f"queue:{assigned_to}", json.dumps(msg))
-                log(f"EVENT_EXECUTED type=TASK_ASSIGNED target={assigned_to} task_id={task_id}", agent)
-
-        # Événements de type REVIEW_REQUEST (Scrum Master → PO)
-        elif evt_type == "SCRUM_REVIEW_COMPLETED":
-            claim_key = f"claim:{agent}_event:{task_id}:po"
-            if not r.set(claim_key, "1", nx=True, ex=3600):
+    total = r.llen(events_key)
+    page = 50
+    for start in range(0, total, page):
+        # Reprendre LLEN à chaque page : la liste peut croître pendant le cycle.
+        batch = r.lrange(events_key, start, start + page - 1)
+        for evt_str in batch:
+            try:
+                evt = json.loads(evt_str)
+            except json.JSONDecodeError:
                 continue
-            msg = make_message(
-                type="REVIEW_REQUEST",
-                to="product-owner",
-                from_=agent,
-                body=f"Demande de revue PO pour tâche {task_id}. Veuillez examiner la livraison.",
-                task_id=task_id,
-                extra={"reply_to": agent},
-            )
-            r.rpush("inbox:product-owner", json.dumps(msg))
-            log(f"EVENT_EXECUTED type=REVIEW_REQUEST target=product-owner task_id={task_id}", agent)
+
+            evt_type = evt.get("type")
+            task_id = evt.get("task_id")
+
+            # Événements de type TASK_ASSIGNED (Scrum Master → dev)
+            if evt_type == "TASK_ASSIGNED":
+                assigned_to = evt.get("assigned_to")
+                if not assigned_to:
+                    continue
+
+                def build_assign(tid, _assigned=assigned_to, _task=task_id, _agent=agent):
+                    msg = make_message(
+                        type="TICKET_ASSIGN",
+                        to=_assigned,
+                        from_=_agent,
+                        body=f"Tâche assignée par {_agent} : {_task}. Veuillez exécuter.",
+                        task_id=_task,
+                        extra={"reply_to": _agent, "workspace_dir": "/root/misfits-web",
+                               "transition_id": tid},
+                    )
+                    return json.dumps(msg)
+
+                try:
+                    tid, outcome = publish_transition_once(
+                        r, agent, evt,
+                        target=f"assign:{assigned_to}",
+                        target_list_key=f"queue:{assigned_to}",
+                        build_payload=build_assign,
+                    )
+                except ValueError:
+                    continue
+                if outcome == "published":
+                    log(f"EVENT_EXECUTED type=TASK_ASSIGNED target={assigned_to} task_id={task_id} transition={tid}", agent)
+
+            # Événements de type REVIEW_REQUEST (Scrum Master → PO)
+            elif evt_type == "SCRUM_REVIEW_COMPLETED":
+
+                def build_review(tid, _task=task_id, _agent=agent):
+                    msg = make_message(
+                        type="REVIEW_REQUEST",
+                        to="product-owner",
+                        from_=_agent,
+                        body=f"Demande de revue PO pour tâche {_task}. Veuillez examiner la livraison.",
+                        task_id=_task,
+                        extra={"reply_to": _agent, "transition_id": tid},
+                    )
+                    return json.dumps(msg)
+
+                try:
+                    tid, outcome = publish_transition_once(
+                        r, agent, evt,
+                        target="po",
+                        target_list_key="inbox:product-owner",
+                        build_payload=build_review,
+                    )
+                except ValueError:
+                    continue
+                if outcome == "published":
+                    log(f"EVENT_EXECUTED type=REVIEW_REQUEST target=product-owner task_id={task_id} transition={tid}", agent)
 
 
 def main():
