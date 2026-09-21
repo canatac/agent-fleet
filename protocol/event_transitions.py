@@ -16,9 +16,10 @@ Solution :
     une identité distincte → publication autorisée.
   - Marqueur durable SADD (sans expiration) : fleet:transitions:<agent>.
   - Publication + marquage atomiques via script Lua quand le marqueur et
-    l'inbox cible sont dans la même instance Redis.
-  - Le claim NX EX reste utilisé uniquement comme garde anti-concurrence
-    immédiate, jamais comme mémoire des événements traités.
+    l'inbox cible sont dans la même instance Redis (c'est le cas du
+    déploiement actuel ; AUCUN fallback inter-instance n'est implémenté :
+    si les deux clés ne sont pas sur la même instance, publish_transition_once
+    est inapplicable tel quel).
 
 Limites documentées :
   - Exactement-une-exécution n'est PAS garanti pour les effets externes ;
@@ -26,9 +27,10 @@ Limites documentées :
   - La durabilité dépend de la persistance Redis (AOF/RDB) et de la
     conservation du set fleet:transitions:<agent>. Une perte de données Redis
     peut autoriser une republication.
-  - Si marqueur et inbox sont sur des instances différentes, fallback
-    non-atomique (SADD puis RPUSH) avec risque documenté de doublon en cas
-    de crash entre les deux opérations.
+  - Aucun verrou anti-concurrence supplémentaire n'est posé dans ce module :
+    l'atomicité du script Lua (SISMEMBER → RPUSH → SADD) suffit à garantir
+    qu'un seul client publie ; le claim NX historique n'est PAS utilisé dans
+    ce chemin.
 """
 
 from __future__ import annotations
@@ -46,7 +48,8 @@ def transitions_key(agent: str) -> str:
 
 
 def transition_claim_key(agent: str, transition_id: str) -> str:
-    """Claim temporaire anti-concurrence (jamais mémoire)."""
+    """Claim temporaire historique (NON utilisé par publish_transition_once ;
+    conservé pour référence — l'atomicité du Lua suffit)."""
     return f"claim:transition:{agent}:{transition_id}"
 
 

@@ -277,10 +277,10 @@ def process_agent_events(r, agent: str) -> None:
                         target_list_key=f"queue:{assigned_to}",
                         build_payload=build_assign,
                     )
-                except ValueError:
+                except ValueError as e:
+                    # Événement invalide : journalisé, JAMAIS publié ni marqué.
+                    log(f"EVENT_INVALID type=TASK_ASSIGNED task_id={task_id} error={e}", agent, "WARN")
                     continue
-                if outcome == "published":
-                    log(f"EVENT_EXECUTED type=TASK_ASSIGNED target={assigned_to} task_id={task_id} transition={tid}", agent)
 
             # Événements de type REVIEW_REQUEST (Scrum Master → PO)
             elif evt_type == "SCRUM_REVIEW_COMPLETED":
@@ -303,7 +303,9 @@ def process_agent_events(r, agent: str) -> None:
                         target_list_key="inbox:product-owner",
                         build_payload=build_review,
                     )
-                except ValueError:
+                except ValueError as e:
+                    # Événement invalide : journalisé, JAMAIS publié ni marqué.
+                    log(f"EVENT_INVALID type=SCRUM_REVIEW_COMPLETED task_id={task_id} error={e}", agent, "WARN")
                     continue
                 if outcome == "published":
                     log(f"EVENT_EXECUTED type=REVIEW_REQUEST target=product-owner task_id={task_id} transition={tid}", agent)
